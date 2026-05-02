@@ -503,7 +503,11 @@ function handleImport(event) {
 }
 
 function exportFile() {
-  const blob = new Blob([JSON.stringify(seriesData,null,2)],{type:'application/json'});
+  const exportData = seriesData.map(item => ({
+    ...item,
+    genres: (item._genreIds || []).map(id => GENRE_MAP[id]).filter(Boolean)
+  }));
+  const blob = new Blob([JSON.stringify(exportData,null,2)],{type:'application/json'});
   const a = document.createElement('a');
   a.href=URL.createObjectURL(blob); a.download='series.json'; a.click();
 }
