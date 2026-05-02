@@ -4,30 +4,42 @@ let isLoggedIn = false;
 let isDarkMode = true;
 let currentRating = 0;
 
-// ─── Auth ─────────────────────────────────────────────────────────────────────
-// Credentials come from .env via a small build step or Netlify env injection.
-// If you're running locally without a build tool, set them here as fallback:
-const ENV_USER = window.__ENV_USER__ || "admin";
-const ENV_PASS = window.__ENV_PASS__ || "123456";
+// ─── Auth (server-side via Netlify Function — no credentials in client code) ──
+async function verifyCredentials(user, pass) {
+  try {
+    const res = await fetch('/.netlify/functions/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user, pass })
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return data.ok === true;
+  } catch {
+    // If running without Netlify (e.g. plain file:// or non-netlify server)
+    console.warn('Auth function unavailable. Run via `netlify dev` for local auth.');
+    return false;
+  }
+}
 
-function checkStoredLogin() {
+async function checkStoredLogin() {
   const stored = localStorage.getItem('wl_auth');
   if (!stored) return false;
   try {
     const { u, p } = JSON.parse(stored);
-    return u === ENV_USER && p === ENV_PASS;
+    return await verifyCredentials(u, p);
   } catch { return false; }
 }
 
-function login(user, pass) {
-  if (user === ENV_USER && pass === ENV_PASS) {
+async function login(user, pass) {
+  const ok = await verifyCredentials(user, pass);
+  if (ok) {
     localStorage.setItem('wl_auth', JSON.stringify({ u: user, p: pass }));
     isLoggedIn = true;
     renderHeader();
     renderGrid();
-    return true;
   }
-  return false;
+  return ok;
 }
 
 function logout() {
@@ -45,7 +57,7 @@ async function init() {
   applyTheme();
 
   // Check stored login
-  isLoggedIn = checkStoredLogin();
+  isLoggedIn = await checkStoredLogin();
 
   // Load data
   try {
@@ -61,14 +73,60 @@ async function init() {
   populateCategories();
   renderHeader();
   filterData();
+
+  // Refresh metadata from TMDB for items that haven't been fetched yet
+  refreshFromTMDB();
+}
+
+// ─── TMDB Refresh ─────────────────────────────────────────────────────────────
+async function fetchTMDBData(title, year, isMovie) {
+  try {
+    const params = new URLSearchParams({ title, isMovie: isMovie ? '1' : '0' });
+    if (year) params.set('year', year);
+    const res = await fetch(`/.netlify/functions/tmdb?${params}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+async function refreshFromTMDB() {
+  // Only fetch for items that haven't been matched to TMDB yet
+  const needsFetch = seriesData.filter(item => !item._tmdbId && item.title);
+  if (needsFetch.length === 0) return;
+
+  let changed = false;
+  for (const item of needsFetch) {
+    const data = await fetchTMDBData(item.title, item.year, item.isMovie);
+    if (data && data.id) {
+      item._tmdbId = data.id;
+      // Only overwrite poster if item doesn't have one already
+      if (data.poster && !item.poster) {
+        item.poster = data.poster;
+        changed = true;
+      }
+      // Only overwrite year if missing
+      if (data.year && !item.year) {
+        item.year = data.year;
+        changed = true;
+      }
+      if (data.poster || data.year) changed = true;
+    }
+    // Respect TMDB rate limits (~40 req/10s)
+    await new Promise(r => setTimeout(r, 260));
+  }
+
+  if (changed) {
+    saveData();
+    filterData(); // re-render with updated posters
+  }
 }
 
 // ─── Categories ───────────────────────────────────────────────────────────────
-// Since the JSON has no category field, we auto-categorize based on properties.
-// This runs once at startup and assigns a `_category` field to each item.
 function assignCategories() {
   seriesData.forEach(item => {
-    if (item._category) return; // already assigned
+    if (item._category) return;
     const p = item.playerData || {};
     if (item.isMovie) {
       item._category = 'Movies';
@@ -86,7 +144,6 @@ function populateCategories() {
   assignCategories();
   const cats = [...new Set(seriesData.map(x => x._category).filter(Boolean))].sort();
   const sel = document.getElementById('categoryFilter');
-  // Keep first option
   while (sel.options.length > 1) sel.remove(1);
   cats.forEach(c => {
     const opt = document.createElement('option');
@@ -101,27 +158,22 @@ function renderHeader() {
   const container = document.getElementById('headerBtns');
   container.innerHTML = '';
 
-  // Theme toggle
   const themeBtn = el('button', 'btn-icon', `<i class="fas fa-${isDarkMode ? 'sun' : 'moon'}"></i>`);
   themeBtn.title = 'Toggle theme';
   themeBtn.onclick = toggleTheme;
   container.appendChild(themeBtn);
 
   if (isLoggedIn) {
-    // Import
     const importBtn = el('button', 'btn-secondary', '<i class="fas fa-file-import" style="margin-right:6px"></i>Import');
     importBtn.onclick = () => document.getElementById('fileInput').click();
     container.appendChild(importBtn);
 
-    // Export
     container.appendChild(makeExportBtn());
 
-    // Add
     const addBtn = el('button', 'btn-primary', '+ Add Series');
     addBtn.onclick = () => openModal();
     container.appendChild(addBtn);
 
-    // Logout
     const logoutBtn = el('button', 'btn-secondary', '<i class="fas fa-sign-out-alt" style="margin-right:6px"></i>Logout');
     logoutBtn.onclick = logout;
     container.appendChild(logoutBtn);
@@ -151,7 +203,7 @@ function toggleTheme() {
   isDarkMode = !isDarkMode;
   localStorage.setItem('wl_theme', isDarkMode ? 'dark' : 'light');
   applyTheme();
-  renderHeader(); // refresh icon
+  renderHeader();
 }
 
 function applyTheme() {
@@ -171,7 +223,7 @@ function renderGrid(list = seriesData) {
     return;
   }
 
-  list.forEach((item, idx) => {
+  list.forEach((item) => {
     const realIdx = seriesData.indexOf(item);
     const p = item.playerData || {};
     const finished = p.finished;
@@ -371,6 +423,12 @@ function saveModal(index) {
   else if (season > 1) newItem._category = 'Ongoing';
   else newItem._category = 'Watching';
 
+  // If title changed, clear TMDB cache so it re-fetches on next reload
+  if (index >= 0 && seriesData[index].title !== title) {
+    delete newItem._tmdbId;
+    delete newItem.poster;
+  }
+
   if (index >= 0) {
     seriesData[index] = newItem;
   } else {
@@ -424,14 +482,21 @@ function showLoginModal() {
   setTimeout(() => document.getElementById('lUser')?.focus(), 100);
 }
 
-function doLogin() {
+async function doLogin() {
   const u = document.getElementById('lUser').value.trim();
   const p = document.getElementById('lPass').value;
-  if (login(u, p)) {
+
+  // Disable button while verifying
+  const btn = document.querySelector('#modalContent .btn-primary');
+  if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+
+  const ok = await login(u, p);
+  if (ok) {
     closeModal();
   } else {
     document.getElementById('loginError').style.display = 'block';
     document.getElementById('lPass').value = '';
+    if (btn) { btn.disabled = false; btn.textContent = 'Login'; }
   }
 }
 
@@ -445,12 +510,13 @@ function handleImport(event) {
       const imported = JSON.parse(e.target.result);
       if (!Array.isArray(imported)) throw new Error('Not an array');
       seriesData = imported;
-      // Clear categories so they get reassigned
       seriesData.forEach(x => delete x._category);
       saveData();
       populateCategories();
       filterData();
       alert(`✅ Imported ${imported.length} titles.`);
+      // Kick off TMDB refresh for newly imported items
+      refreshFromTMDB();
     } catch {
       alert('❌ Invalid JSON file.');
     }
