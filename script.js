@@ -4,15 +4,62 @@ let isLoggedIn = false;
 let isDarkMode = true;
 let currentRating = 0;
 
-// ─── TMDB Genre Map ───────────────────────────────────────────────────────────
 const GENRE_MAP = {
-  28:'Action', 12:'Adventure', 16:'Animation', 35:'Comedy', 80:'Crime',
-  99:'Documentary', 18:'Drama', 10751:'Family', 14:'Fantasy', 36:'History',
-  27:'Horror', 10402:'Music', 9648:'Mystery', 10749:'Romance', 878:'Sci-Fi',
-  10770:'TV Movie', 53:'Thriller', 10752:'War', 37:'Western',
-  10759:'Action & Adv.', 10762:'Kids', 10763:'News', 10764:'Reality',
-  10765:'Sci-Fi & Fantasy', 10766:'Soap', 10767:'Talk', 10768:'War & Politics'
+  28:'Action',12:'Adventure',16:'Animation',35:'Comedy',80:'Crime',
+  99:'Documentary',18:'Drama',10751:'Family',14:'Fantasy',36:'History',
+  27:'Horror',10402:'Music',9648:'Mystery',10749:'Romance',878:'Sci-Fi',
+  10770:'TV Movie',53:'Thriller',10752:'War',37:'Western',
+  10759:'Action & Adv.',10762:'Kids',10763:'News',10764:'Reality',
+  10765:'Sci-Fi & Fantasy',10766:'Soap',10767:'Talk',10768:'War & Politics'
 };
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+// Key fix: render data FIRST from localStorage (sync), auth check in background.
+// This prevents the blank-page-on-refresh bug.
+async function init() {
+  // 1. Theme — instant, no network
+  isDarkMode = localStorage.getItem('wl_theme') !== 'light';
+  applyTheme();
+
+  // 2. Load data from localStorage immediately so the grid renders right away
+  const savedRaw = localStorage.getItem('wl_data');
+  if (savedRaw) {
+    try { seriesData = JSON.parse(savedRaw); } catch { seriesData = []; }
+  }
+
+  // 3. Render the page with current data + isLoggedIn=false header
+  populateCategories();
+  renderHeader();
+  filterData(); // grid renders here — no waiting for network
+
+  // 4. Auth check in background — updates header/edit buttons when done
+  checkStoredLogin().then(ok => {
+    if (ok !== isLoggedIn) {
+      isLoggedIn = ok;
+      renderHeader();
+      renderGrid(); // refresh so edit button appears on cards
+    }
+  });
+
+  // 5. If no localStorage data, load from series.json
+  if (!savedRaw || seriesData.length === 0) {
+    try {
+      const res = await fetch('series.json');
+      if (res.ok) {
+        const fromFile = await res.json();
+        if (Array.isArray(fromFile) && fromFile.length > 0) {
+          seriesData = fromFile;
+          populateCategories();
+          filterData();
+          saveData();
+        }
+      }
+    } catch { /* series.json not available */ }
+  }
+
+  // 6. TMDB enrichment in background (non-blocking)
+  refreshFromTMDB();
+}
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 async function verifyCredentials(user, pass) {
@@ -25,10 +72,7 @@ async function verifyCredentials(user, pass) {
     if (!res.ok) return false;
     const data = await res.json();
     return data.ok === true;
-  } catch {
-    console.warn('Auth function unavailable. Run via `netlify dev` locally.');
-    return false;
-  }
+  } catch { return false; }
 }
 
 async function checkStoredLogin() {
@@ -46,7 +90,7 @@ async function login(user, pass) {
     localStorage.setItem('wl_auth', JSON.stringify({ u: user, p: pass }));
     isLoggedIn = true;
     renderHeader();
-    renderGrid();
+    filterData();
   }
   return ok;
 }
@@ -55,38 +99,17 @@ function logout() {
   localStorage.removeItem('wl_auth');
   isLoggedIn = false;
   renderHeader();
-  renderGrid();
-}
-
-// ─── Init ─────────────────────────────────────────────────────────────────────
-async function init() {
-  const storedTheme = localStorage.getItem('wl_theme');
-  isDarkMode = storedTheme !== 'light';
-  applyTheme();
-
-  isLoggedIn = await checkStoredLogin();
-
-  try {
-    const res = await fetch('series.json');
-    const fromFile = await res.json();
-    const saved = localStorage.getItem('wl_data');
-    seriesData = saved ? JSON.parse(saved) : fromFile;
-  } catch {
-    const saved = localStorage.getItem('wl_data');
-    seriesData = saved ? JSON.parse(saved) : [];
-  }
-
-  populateCategories();
-  renderHeader();
   filterData();
-
-  refreshFromTMDB();
 }
 
 // ─── TMDB Refresh ─────────────────────────────────────────────────────────────
 async function fetchTMDBData(title, year, isMovie) {
   try {
-    const params = new URLSearchParams({ title, isMovie: isMovie ? '1' : '0' });
+    const params = new URLSearchParams({
+      title,
+      isMovie: isMovie ? '1' : '0',
+      v: '3' // cache-bust: increment when tmdb.js response shape changes
+    });
     if (year) params.set('year', year);
     const res = await fetch(`/.netlify/functions/tmdb?${params}`);
     if (!res.ok) return null;
@@ -95,8 +118,8 @@ async function fetchTMDBData(title, year, isMovie) {
 }
 
 async function refreshFromTMDB() {
-  // Fetch if: no TMDB ID yet, OR already matched but missing overview/genres
-  // (handles the case where items were fetched before overview/genres were added)
+  // Re-fetch any item missing overview or genres (even if _tmdbId is set —
+  // older cached responses didn't include those fields)
   const needsFetch = seriesData.filter(item =>
     item.title && (!item._tmdbId || !item._overview || !item._genreIds?.length)
   );
@@ -111,22 +134,18 @@ async function refreshFromTMDB() {
       batch.map(item => fetchTMDBData(item.title, item.year, item.isMovie))
     );
 
-    let batchChanged = false;
+    let changed = false;
     results.forEach((data, j) => {
       const item = batch[j];
-      if (!data || !data.id) return;
+      if (!data?.id) return;
       item._tmdbId = data.id;
-      if (data.poster   && !item.poster)        { item.poster    = data.poster;    batchChanged = true; }
-      if (data.year     && !item.year)           { item.year      = data.year;      batchChanged = true; }
-      if (data.overview && data.overview.trim()) { item._overview = data.overview;  batchChanged = true; }
-      if (data.genreIds?.length)                 { item._genreIds = data.genreIds;  batchChanged = true; }
+      if (data.poster   && !item.poster)        { item.poster    = data.poster;    changed = true; }
+      if (data.year     && !item.year)           { item.year      = data.year;      changed = true; }
+      if (data.overview?.trim())                 { item._overview = data.overview;  changed = true; }
+      if (data.genreIds?.length)                 { item._genreIds = data.genreIds;  changed = true; }
     });
 
-    if (batchChanged) {
-      saveData();
-      filterData();
-    }
-
+    if (changed) { saveData(); filterData(); }
     if (i + BATCH < needsFetch.length) await new Promise(r => setTimeout(r, DELAY));
   }
 }
@@ -147,12 +166,15 @@ function populateCategories() {
   assignCategories();
   const cats = [...new Set(seriesData.map(x => x._category).filter(Boolean))].sort();
   const sel = document.getElementById('categoryFilter');
+  const prev = sel.value;
   while (sel.options.length > 1) sel.remove(1);
   cats.forEach(c => {
     const opt = document.createElement('option');
     opt.value = c; opt.textContent = c;
     sel.appendChild(opt);
   });
+  // Restore previously selected category if still valid
+  if (prev && cats.includes(prev)) sel.value = prev;
 }
 
 // ─── Render Header ────────────────────────────────────────────────────────────
@@ -166,83 +188,104 @@ function renderHeader() {
   container.appendChild(themeBtn);
 
   if (isLoggedIn) {
-    const importBtn = el('button', 'btn-secondary', '<i class="fas fa-file-import" style="margin-right:6px"></i>Import');
+    const importBtn = el('button', 'btn-secondary', '<i class="fas fa-file-import mr-icon"></i>Import');
     importBtn.onclick = () => document.getElementById('fileInput').click();
     container.appendChild(importBtn);
     container.appendChild(makeExportBtn());
     const addBtn = el('button', 'btn-primary', '+ Add');
     addBtn.onclick = () => openEditModal();
     container.appendChild(addBtn);
-    const logoutBtn = el('button', 'btn-secondary', '<i class="fas fa-sign-out-alt" style="margin-right:6px"></i>Logout');
+    const logoutBtn = el('button', 'btn-secondary', '<i class="fas fa-sign-out-alt mr-icon"></i>Logout');
     logoutBtn.onclick = logout;
     container.appendChild(logoutBtn);
   } else {
     container.appendChild(makeExportBtn());
-    const loginBtn = el('button', 'btn-primary', '<i class="fas fa-lock" style="margin-right:6px"></i>Login');
+    const loginBtn = el('button', 'btn-primary', '<i class="fas fa-lock mr-icon"></i>Login');
     loginBtn.onclick = showLoginModal;
     container.appendChild(loginBtn);
   }
 }
 
 function makeExportBtn() {
-  const btn = el('button', 'btn-secondary', '<i class="fas fa-file-export" style="margin-right:6px"></i>Export');
+  const btn = el('button', 'btn-secondary', '<i class="fas fa-file-export mr-icon"></i>Export');
   btn.onclick = exportFile;
   return btn;
 }
 
-function el(tag, className, html) {
+function el(tag, cls, html) {
   const e = document.createElement(tag);
-  e.className = className;
-  e.innerHTML = html;
-  return e;
+  e.className = cls; e.innerHTML = html; return e;
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
 function toggleTheme() {
   isDarkMode = !isDarkMode;
   localStorage.setItem('wl_theme', isDarkMode ? 'dark' : 'light');
-  applyTheme();
-  renderHeader();
+  applyTheme(); renderHeader();
 }
+function applyTheme() { document.body.classList.toggle('light-mode', !isDarkMode); }
 
-function applyTheme() {
-  document.body.classList.toggle('light-mode', !isDarkMode);
+// ─── Filter & Sort ────────────────────────────────────────────────────────────
+function filterData() {
+  const q   = (document.getElementById('searchInput')?.value   || '').toLowerCase().trim();
+  const cat = document.getElementById('categoryFilter')?.value  || '';
+  const sort= document.getElementById('sortSelect')?.value      || 'name';
+
+  let result = seriesData.filter(item => {
+    const matchSearch = !q   || item.title.toLowerCase().includes(q);
+    const matchCat    = !cat || item._category === cat;
+    return matchSearch && matchCat;
+  });
+
+  result = [...result].sort((a, b) => {
+    if (sort === 'name')         return a.title.localeCompare(b.title);
+    if (sort === 'year-desc')    return (b.year||0) - (a.year||0);
+    if (sort === 'rating-desc')  return (b.rating||0) - (a.rating||0);
+    if (sort === 'updated-desc')
+      return new Date(b.playerData?.updatedAt||0) - new Date(a.playerData?.updatedAt||0);
+    return 0;
+  });
+
+  const countEl = document.getElementById('count');
+  if (countEl) countEl.textContent = `${result.length} of ${seriesData.length} titles`;
+
+  renderGrid(result);
 }
 
 // ─── Grid Render ──────────────────────────────────────────────────────────────
 function renderGrid(list = seriesData) {
   const grid = document.getElementById('seriesGrid');
+  if (!grid) return;
   grid.innerHTML = '';
 
   if (list.length === 0) {
     grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1">
       <i class="fas fa-tv" style="font-size:3rem;opacity:0.2;display:block;margin-bottom:16px"></i>
-      No series found.
+      ${seriesData.length === 0 ? 'No titles yet. Import or add one!' : 'No results found.'}
     </div>`;
     return;
   }
 
   list.forEach(item => {
-    const realIdx = seriesData.indexOf(item);
+    const idx = seriesData.indexOf(item);
     const p = item.playerData || {};
 
-    let badgeHtml = '';
-    if (item.isMovie)   badgeHtml = `<span class="badge badge-movie">Movie</span>`;
-    else if (p.finished) badgeHtml = `<span class="badge badge-finished">Finished</span>`;
-    else                badgeHtml = `<span class="badge badge-watching">S${p.season||1} E${p.episode||0}</span>`;
+    let badgeHtml = item.isMovie
+      ? `<span class="badge badge-movie">Movie</span>`
+      : p.finished
+        ? `<span class="badge badge-finished">Finished</span>`
+        : `<span class="badge badge-watching">S${p.season||1} E${p.episode||0}</span>`;
 
     const stars = Array(5).fill(0).map((_,n) =>
       `<span style="color:${n < Math.floor(item.rating||0) ? '#f5c518' : 'var(--border)'}">★</span>`
     ).join('');
 
-    // Genres — max 2 on card (keeps it compact)
-    const genres = (item._genreIds || []).slice(0,2).map(id => GENRE_MAP[id]).filter(Boolean);
+    const genres = (item._genreIds||[]).slice(0,2).map(id=>GENRE_MAP[id]).filter(Boolean);
     const genresHtml = genres.length
-      ? `<div class="card-genres">${genres.map(g => `<span class="genre-tag">${g}</span>`).join('')}</div>`
+      ? `<div class="card-genres">${genres.map(g=>`<span class="genre-tag">${g}</span>`).join('')}</div>`
       : '';
 
-    // Description — 2 lines
-    const overviewHtml = item._overview
+    const descHtml = item._overview
       ? `<p class="card-desc">${escHtml(item._overview)}</p>`
       : '';
 
@@ -252,22 +295,19 @@ function renderGrid(list = seriesData) {
       <div class="poster-container">
         ${item.poster
           ? `<img src="${item.poster}" loading="lazy" alt="${escHtml(item.title)}">`
-          : `<div class="poster-placeholder"><i class="fas fa-tv"></i></div>`
-        }
+          : `<div class="poster-placeholder"><i class="fas fa-tv"></i></div>`}
       </div>
       <div class="card-body">
         <div class="card-title">${escHtml(item.title)}</div>
         <div class="card-meta">
-          <span class="card-year">${item.year || '—'}</span>
+          <span class="card-year">${item.year||'—'}</span>
           ${badgeHtml}
         </div>
-        ${overviewHtml}
+        ${descHtml}
         ${genresHtml}
         <div class="card-stars">${stars}</div>
-      </div>
-    `;
-    // All users: click opens detail modal
-    card.onclick = () => openDetailModal(realIdx);
+      </div>`;
+    card.onclick = () => openDetailModal(idx);
     grid.appendChild(card);
   });
 }
@@ -278,84 +318,65 @@ function openDetailModal(index) {
   if (!item) return;
   const p = item.playerData || {};
 
-  // Status badge
-  let statusHtml = '';
-  if (item.isMovie)    statusHtml = `<span class="badge badge-movie">Movie</span>`;
-  else if (p.finished) statusHtml = `<span class="badge badge-finished">Finished</span>`;
-  else                 statusHtml = `<span class="badge badge-watching">Watching — S${p.season||1} E${p.episode||0}</span>`;
+  const statusHtml = item.isMovie
+    ? `<span class="badge badge-movie">Movie</span>`
+    : p.finished
+      ? `<span class="badge badge-finished">Finished</span>`
+      : `<span class="badge badge-watching">Watching — S${p.season||1} E${p.episode||0}</span>`;
 
-  // Full star rating display
-  const ratingStars = Array(5).fill(0).map((_,n) =>
-    `<span style="font-size:1.1rem;color:${n < Math.floor(item.rating||0) ? '#f5c518' : 'var(--border)'}">★</span>`
+  const ratingStars = Array(5).fill(0).map((_,n)=>
+    `<span style="font-size:1.15rem;color:${n < Math.floor(item.rating||0) ? '#f5c518' : 'var(--border)'}">★</span>`
   ).join('');
   const ratingText = item.rating ? `${item.rating} / 5` : 'Not rated';
 
-  // All genres
-  const genres = (item._genreIds || []).map(id => GENRE_MAP[id]).filter(Boolean);
+  const genres = (item._genreIds||[]).map(id=>GENRE_MAP[id]).filter(Boolean);
   const genresHtml = genres.length
-    ? `<div class="detail-genres">${genres.map(g => `<span class="genre-tag genre-tag-lg">${g}</span>`).join('')}</div>`
+    ? `<div class="detail-genres">${genres.map(g=>`<span class="genre-tag genre-tag-lg">${g}</span>`).join('')}</div>`
     : '';
 
   const overview = item._overview
     ? `<p class="detail-overview">${escHtml(item._overview)}</p>`
-    : `<p class="detail-overview" style="opacity:0.4;font-style:italic">No description available.</p>`;
+    : `<p class="detail-overview no-desc">No description available yet.</p>`;
 
-  // Admin-only action buttons
+  // Admin actions
   const adminHtml = isLoggedIn ? `
-    <div style="display:flex;gap:8px;margin-top:4px">
-      <button onclick="openEditModal(${index})" class="btn-primary" style="flex:1;padding:10px;font-size:0.88rem">
+    <div class="detail-actions">
+      <button onclick="openEditModal(${index})" class="btn-primary detail-btn">
         <i class="fas fa-pen" style="margin-right:6px"></i>Edit
       </button>
-      <button onclick="deleteItem(${index})" class="btn-danger" style="padding:10px 14px">
+      <button onclick="confirmDelete(${index})" class="btn-danger-sm" title="Delete">
         <i class="fas fa-trash"></i>
       </button>
-    </div>
-  ` : '';
+    </div>` : '';
 
-  const modal = document.getElementById('modal');
-  const content = document.getElementById('modalContent');
-  modal.dataset.mode = 'detail';
-  content.innerHTML = `
+  document.getElementById('modalContent').className = 'modal-box-detail';
+  document.getElementById('modalContent').innerHTML = `
     <div class="detail-layout">
-      <!-- Poster -->
       <div class="detail-poster-wrap">
         ${item.poster
           ? `<img src="${item.poster}" class="detail-poster-img" alt="${escHtml(item.title)}">`
-          : `<div class="detail-poster-placeholder"><i class="fas fa-tv"></i></div>`
-        }
+          : `<div class="detail-poster-placeholder"><i class="fas fa-tv"></i></div>`}
       </div>
-
-      <!-- Info -->
       <div class="detail-info">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:10px">
+        <div class="detail-header">
           <h2 class="detail-title">${escHtml(item.title)}</h2>
-          <button onclick="closeModal()" class="btn-close-x">✕</button>
+          <button onclick="closeModal()" class="btn-close-x" title="Close">✕</button>
         </div>
-
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <div class="detail-meta">
           ${item.year ? `<span class="detail-year">${item.year}</span>` : ''}
           ${statusHtml}
         </div>
-
         ${genresHtml}
-
         ${overview}
-
-        <div class="detail-rating-row">
-          <span class="detail-rating-stars">${ratingStars}</span>
-          <span class="detail-rating-label">${ratingText}</span>
+        <div class="detail-rating">
+          ${ratingStars}
+          <span class="rating-label">${ratingText}</span>
         </div>
-
         ${adminHtml}
-
-        ${!isLoggedIn ? `
-          <button onclick="closeModal()" class="btn-secondary" style="width:100%;padding:10px;margin-top:4px">Close</button>
-        ` : ''}
       </div>
-    </div>
-  `;
+    </div>`;
 
-  modal.classList.add('active');
+  document.getElementById('modal').classList.add('active');
 }
 
 // ─── Edit Modal ───────────────────────────────────────────────────────────────
@@ -364,40 +385,33 @@ function openEditModal(index = -1) {
   const p = item.playerData || {};
   currentRating = item.rating || 0;
 
-  const modal = document.getElementById('modal');
-  const content = document.getElementById('modalContent');
-  modal.dataset.mode = 'edit';
+  const backAction = index >= 0 ? `openDetailModal(${index})` : 'closeModal()';
 
-  content.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
-      <h2 style="font-size:1.2rem;font-weight:700;color:var(--text)">${index === -1 ? 'Add New Title' : 'Edit Title'}</h2>
-      <button onclick="${index >= 0 ? `openDetailModal(${index})` : 'closeModal()'}" class="btn-close-x">✕</button>
+  document.getElementById('modalContent').className = 'modal-box-form';
+  document.getElementById('modalContent').innerHTML = `
+    <div class="edit-header">
+      <h2 class="edit-title">${index === -1 ? 'Add New Title' : 'Edit Title'}</h2>
+      <button onclick="${backAction}" class="btn-close-x" title="Close">✕</button>
     </div>
 
     <label class="form-label">Title</label>
     <input id="mTitle" value="${escHtml(item.title||'')}" class="input-field" placeholder="Series or movie title" style="margin-bottom:14px">
 
     <label class="form-label">Year</label>
-    <input id="mYear" type="number" value="${item.year||''}" class="input-field" placeholder="e.g. 2024" style="margin-bottom:14px">
+    <input id="mYear" type="number" value="${item.year||''}" class="input-field" placeholder="e.g. 2024" style="margin-bottom:16px">
 
-    <div style="display:flex;gap:24px;margin-bottom:16px">
-      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">
-        <label class="toggle-switch">
-          <input type="checkbox" id="mMovie" ${item.isMovie ? 'checked' : ''} onchange="updateProgressSection()">
-          <span class="toggle-track"></span>
-        </label>
+    <div class="toggle-row">
+      <label class="toggle-label">
+        <label class="toggle-switch"><input type="checkbox" id="mMovie" ${item.isMovie?'checked':''} onchange="updateProgressSection()"><span class="toggle-track"></span></label>
         Movie
       </label>
-      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">
-        <label class="toggle-switch">
-          <input type="checkbox" id="mFinished" ${p.finished ? 'checked' : ''} onchange="updateProgressSection()">
-          <span class="toggle-track"></span>
-        </label>
+      <label class="toggle-label">
+        <label class="toggle-switch"><input type="checkbox" id="mFinished" ${p.finished?'checked':''} onchange="updateProgressSection()"><span class="toggle-track"></span></label>
         Finished
       </label>
     </div>
 
-    <div id="progressSection" style="${(p.finished || item.isMovie) ? 'display:none' : ''}">
+    <div id="progressSection" style="${(p.finished||item.isMovie)?'display:none':''}">
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">
         <div>
           <label class="form-label">Season</label>
@@ -412,43 +426,33 @@ function openEditModal(index = -1) {
 
     <label class="form-label">My Rating</label>
     <div class="star-row" id="starRow">
-      ${[1,2,3,4,5].map(n => `
-        <button class="star-btn ${n <= Math.floor(currentRating) ? 'active' : ''}"
+      ${[1,2,3,4,5].map(n=>`
+        <button class="star-btn ${n<=Math.floor(currentRating)?'active':''}"
           onmouseover="previewRating(${n})" onmouseleave="renderStars()" onclick="setRating(${n})">★</button>
       `).join('')}
     </div>
-    <div id="ratingLabel" style="font-size:0.85rem;color:var(--text-muted);margin-top:4px;margin-bottom:20px">
-      ${currentRating > 0 ? currentRating + ' / 5' : 'Not rated'}
-    </div>
+    <div id="ratingLabel" class="rating-hint">${currentRating>0?currentRating+' / 5':'Not rated'}</div>
 
-    <div style="display:flex;gap:10px">
+    <div class="edit-actions">
       <button onclick="saveModal(${index})" class="btn-primary" style="flex:1;padding:12px">Save</button>
-      <button onclick="${index >= 0 ? `openDetailModal(${index})` : 'closeModal()'}" class="btn-secondary" style="flex:1;padding:12px">Cancel</button>
-    </div>
-  `;
+      <button onclick="${backAction}" class="btn-secondary" style="flex:1;padding:12px">Cancel</button>
+    </div>`;
 
-  modal.classList.add('active');
+  document.getElementById('modal').classList.add('active');
 }
-
-// Keep openModal as alias for backward compat
-function openModal(index) { openEditModal(index); }
 
 function updateProgressSection() {
-  const isMovie  = document.getElementById('mMovie').checked;
-  const finished = document.getElementById('mFinished').checked;
-  document.getElementById('progressSection').style.display = (isMovie || finished) ? 'none' : '';
+  const hide = document.getElementById('mMovie').checked || document.getElementById('mFinished').checked;
+  document.getElementById('progressSection').style.display = hide ? 'none' : '';
 }
-
 function previewRating(n) {
-  document.querySelectorAll('.star-btn').forEach((btn, i) => btn.classList.toggle('active', i < n));
-  document.getElementById('ratingLabel').textContent = n + ' / 5';
+  document.querySelectorAll('.star-btn').forEach((b,i)=>b.classList.toggle('active',i<n));
+  document.getElementById('ratingLabel').textContent = n+' / 5';
 }
-
-function setRating(n) { currentRating = n; renderStars(); }
-
+function setRating(n) { currentRating=n; renderStars(); }
 function renderStars() {
-  document.querySelectorAll('.star-btn').forEach((btn, i) => btn.classList.toggle('active', i < currentRating));
-  document.getElementById('ratingLabel').textContent = currentRating > 0 ? currentRating + ' / 5' : 'Not rated';
+  document.querySelectorAll('.star-btn').forEach((b,i)=>b.classList.toggle('active',i<currentRating));
+  document.getElementById('ratingLabel').textContent = currentRating>0?currentRating+' / 5':'Not rated';
 }
 
 function saveModal(index) {
@@ -457,60 +461,49 @@ function saveModal(index) {
 
   const isMovie  = document.getElementById('mMovie').checked;
   const finished = document.getElementById('mFinished').checked;
-  const season   = parseInt(document.getElementById('mSeason')?.value) || 1;
-  const episode  = parseInt(document.getElementById('mEpisode')?.value) || 0;
-  const year     = parseInt(document.getElementById('mYear').value) || null;
+  const season   = parseInt(document.getElementById('mSeason')?.value)||1;
+  const episode  = parseInt(document.getElementById('mEpisode')?.value)||0;
+  const year     = parseInt(document.getElementById('mYear').value)||null;
 
-  const base = index >= 0 ? seriesData[index] : { id: 'user_' + Date.now() };
+  const base = index>=0 ? seriesData[index] : {id:'user_'+Date.now()};
   const newItem = {
-    ...base, title, year, rating: currentRating, isMovie,
-    playerData: { ...(base.playerData||{}), finished, season, episode, updatedAt: new Date().toISOString() }
+    ...base, title, year, rating:currentRating, isMovie,
+    playerData:{...(base.playerData||{}), finished, season, episode, updatedAt:new Date().toISOString()}
   };
 
   delete newItem._category;
-  if (isMovie)       newItem._category = 'Movies';
-  else if (finished) newItem._category = 'Finished';
-  else if (season>1) newItem._category = 'Ongoing';
-  else               newItem._category = 'Watching';
+  if (isMovie)       newItem._category='Movies';
+  else if (finished) newItem._category='Finished';
+  else if (season>1) newItem._category='Ongoing';
+  else               newItem._category='Watching';
 
-  // Clear TMDB cache if title changed
-  if (index >= 0 && seriesData[index].title !== title) {
+  if (index>=0 && seriesData[index].title!==title) {
     delete newItem._tmdbId; delete newItem.poster;
     delete newItem._overview; delete newItem._genreIds;
   }
 
-  if (index >= 0) seriesData[index] = newItem;
+  if (index>=0) seriesData[index]=newItem;
   else seriesData.push(newItem);
 
-  saveData();
-  populateCategories();
-  filterData();
-
-  // After saving, go back to detail view (or close if new)
-  if (index >= 0) openDetailModal(index);
-  else closeModal();
+  saveData(); populateCategories(); filterData();
+  if (index>=0) openDetailModal(index); else closeModal();
 }
 
-function deleteItem(index) {
+function confirmDelete(index) {
   if (!confirm(`Delete "${seriesData[index].title}"?`)) return;
-  seriesData.splice(index, 1);
+  seriesData.splice(index,1);
   saveData(); closeModal(); populateCategories(); filterData();
 }
 
-function closeModal() {
-  document.getElementById('modal').classList.remove('active');
-}
-
-function handleOverlayClick(e) {
-  if (e.target === document.getElementById('modal')) closeModal();
-}
+function closeModal() { document.getElementById('modal').classList.remove('active'); }
+function handleOverlayClick(e) { if (e.target===document.getElementById('modal')) closeModal(); }
 
 // ─── Login Modal ──────────────────────────────────────────────────────────────
 function showLoginModal() {
-  const content = document.getElementById('modalContent');
-  content.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
-      <h2 style="font-size:1.3rem;font-weight:700;color:var(--text)">Login</h2>
+  document.getElementById('modalContent').className = 'modal-box-form';
+  document.getElementById('modalContent').innerHTML = `
+    <div class="edit-header">
+      <h2 class="edit-title">Login</h2>
       <button onclick="closeModal()" class="btn-close-x">✕</button>
     </div>
     <div id="loginError" style="display:none;background:rgba(239,68,68,0.1);color:#ef4444;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:0.85rem">
@@ -521,26 +514,24 @@ function showLoginModal() {
     <label class="form-label">Password</label>
     <input id="lPass" type="password" class="input-field" placeholder="Password" style="margin-bottom:20px" onkeydown="if(event.key==='Enter')doLogin()">
     <div style="display:flex;gap:10px">
-      <button onclick="doLogin()" class="btn-primary" style="flex:1;padding:12px">Login</button>
+      <button onclick="doLogin()" class="btn-primary" style="flex:1;padding:12px" id="loginBtn">Login</button>
       <button onclick="closeModal()" class="btn-secondary" style="flex:1;padding:12px">Cancel</button>
-    </div>
-  `;
+    </div>`;
   document.getElementById('modal').classList.add('active');
-  setTimeout(() => document.getElementById('lUser')?.focus(), 100);
+  setTimeout(()=>document.getElementById('lUser')?.focus(),100);
 }
 
 async function doLogin() {
   const u = document.getElementById('lUser').value.trim();
   const p = document.getElementById('lPass').value;
-  const btn = document.querySelector('#modalContent .btn-primary');
-  if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
-  const ok = await login(u, p);
-  if (ok) {
-    closeModal();
-  } else {
-    document.getElementById('loginError').style.display = 'block';
-    document.getElementById('lPass').value = '';
-    if (btn) { btn.disabled = false; btn.textContent = 'Login'; }
+  const btn = document.getElementById('loginBtn');
+  if (btn) { btn.disabled=true; btn.textContent='Checking…'; }
+  const ok = await login(u,p);
+  if (ok) { closeModal(); }
+  else {
+    document.getElementById('loginError').style.display='block';
+    document.getElementById('lPass').value='';
+    if (btn) { btn.disabled=false; btn.textContent='Login'; }
   }
 }
 
@@ -554,28 +545,27 @@ function handleImport(event) {
       const imported = JSON.parse(e.target.result);
       if (!Array.isArray(imported)) throw new Error();
       seriesData = imported;
-      seriesData.forEach(x => delete x._category);
+      seriesData.forEach(x => { delete x._category; });
       saveData(); populateCategories(); filterData();
       alert(`✅ Imported ${imported.length} titles.`);
       refreshFromTMDB();
     } catch { alert('❌ Invalid JSON file.'); }
   };
   reader.readAsText(file);
-  event.target.value = '';
+  event.target.value='';
 }
 
 function exportFile() {
-  const blob = new Blob([JSON.stringify(seriesData, null, 2)], { type: 'application/json' });
+  const blob = new Blob([JSON.stringify(seriesData,null,2)],{type:'application/json'});
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'series.json';
-  a.click();
+  a.href = URL.createObjectURL(blob); a.download='series.json'; a.click();
 }
 
-function saveData() { localStorage.setItem('wl_data', JSON.stringify(seriesData)); }
+function saveData() { localStorage.setItem('wl_data',JSON.stringify(seriesData)); }
 
 function escHtml(str) {
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// ─── Boot ─────────────────────────────────────────────────────────────────────
 init();
