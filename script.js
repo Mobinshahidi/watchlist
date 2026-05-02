@@ -80,11 +80,10 @@ async function init() {
   renderHeader();
   filterData();
 
-  // Kick off TMDB enrichment without blocking the UI
   refreshFromTMDB();
 }
 
-// ─── TMDB Refresh (parallel batches for speed) ────────────────────────────────
+// ─── TMDB Refresh ─────────────────────────────────────────────────────────────
 async function fetchTMDBData(title, year, isMovie) {
   try {
     const params = new URLSearchParams({ title, isMovie: isMovie ? '1' : '0' });
@@ -96,16 +95,18 @@ async function fetchTMDBData(title, year, isMovie) {
 }
 
 async function refreshFromTMDB() {
-  const needsFetch = seriesData.filter(item => !item._tmdbId && item.title);
+  // Fetch if: no TMDB ID yet, OR already matched but missing overview/genres
+  // (handles the case where items were fetched before overview/genres were added)
+  const needsFetch = seriesData.filter(item =>
+    item.title && (!item._tmdbId || !item._overview || !item._genreIds?.length)
+  );
   if (needsFetch.length === 0) return;
 
-  const BATCH = 6; // parallel requests per round
-  const DELAY = 350; // ms between rounds (TMDB allows ~40 req/10s)
+  const BATCH = 6;
+  const DELAY = 350;
 
   for (let i = 0; i < needsFetch.length; i += BATCH) {
     const batch = needsFetch.slice(i, i + BATCH);
-
-    // Fetch all in batch simultaneously
     const results = await Promise.all(
       batch.map(item => fetchTMDBData(item.title, item.year, item.isMovie))
     );
@@ -114,23 +115,19 @@ async function refreshFromTMDB() {
     results.forEach((data, j) => {
       const item = batch[j];
       if (!data || !data.id) return;
-
-      item._tmdbId   = data.id;
-      if (data.poster  && !item.poster)   { item.poster   = data.poster;   batchChanged = true; }
-      if (data.year    && !item.year)     { item.year     = data.year;     batchChanged = true; }
-      if (data.overview)                  { item._overview = data.overview; batchChanged = true; }
-      if (data.genreIds?.length)          { item._genreIds = data.genreIds; batchChanged = true; }
+      item._tmdbId = data.id;
+      if (data.poster   && !item.poster)        { item.poster    = data.poster;    batchChanged = true; }
+      if (data.year     && !item.year)           { item.year      = data.year;      batchChanged = true; }
+      if (data.overview && data.overview.trim()) { item._overview = data.overview;  batchChanged = true; }
+      if (data.genreIds?.length)                 { item._genreIds = data.genreIds;  batchChanged = true; }
     });
 
     if (batchChanged) {
       saveData();
-      filterData(); // re-render progressively as each batch completes
+      filterData();
     }
 
-    // Small pause before next batch
-    if (i + BATCH < needsFetch.length) {
-      await new Promise(r => setTimeout(r, DELAY));
-    }
+    if (i + BATCH < needsFetch.length) await new Promise(r => setTimeout(r, DELAY));
   }
 }
 
@@ -139,10 +136,10 @@ function assignCategories() {
   seriesData.forEach(item => {
     if (item._category) return;
     const p = item.playerData || {};
-    if (item.isMovie)       item._category = 'Movies';
-    else if (p.finished)    item._category = 'Finished';
-    else if (p.season > 1)  item._category = 'Ongoing';
-    else                    item._category = 'Watching';
+    if (item.isMovie)      item._category = 'Movies';
+    else if (p.finished)   item._category = 'Finished';
+    else if (p.season > 1) item._category = 'Ongoing';
+    else                   item._category = 'Watching';
   });
 }
 
@@ -173,8 +170,8 @@ function renderHeader() {
     importBtn.onclick = () => document.getElementById('fileInput').click();
     container.appendChild(importBtn);
     container.appendChild(makeExportBtn());
-    const addBtn = el('button', 'btn-primary', '+ Add Series');
-    addBtn.onclick = () => openModal();
+    const addBtn = el('button', 'btn-primary', '+ Add');
+    addBtn.onclick = () => openEditModal();
     container.appendChild(addBtn);
     const logoutBtn = el('button', 'btn-secondary', '<i class="fas fa-sign-out-alt" style="margin-right:6px"></i>Logout');
     logoutBtn.onclick = logout;
@@ -228,30 +225,23 @@ function renderGrid(list = seriesData) {
   list.forEach(item => {
     const realIdx = seriesData.indexOf(item);
     const p = item.playerData || {};
-    const finished = p.finished;
-    const isMovie = item.isMovie;
 
-    // Badge
     let badgeHtml = '';
-    if (isMovie)    badgeHtml = `<span class="badge badge-movie">Movie</span>`;
-    else if (finished) badgeHtml = `<span class="badge badge-finished">Finished</span>`;
-    else            badgeHtml = `<span class="badge badge-watching">S${p.season||1} E${p.episode||0}</span>`;
+    if (item.isMovie)   badgeHtml = `<span class="badge badge-movie">Movie</span>`;
+    else if (p.finished) badgeHtml = `<span class="badge badge-finished">Finished</span>`;
+    else                badgeHtml = `<span class="badge badge-watching">S${p.season||1} E${p.episode||0}</span>`;
 
-    // Stars
     const stars = Array(5).fill(0).map((_,n) =>
       `<span style="color:${n < Math.floor(item.rating||0) ? '#f5c518' : 'var(--border)'}">★</span>`
     ).join('');
 
-    // Genres (max 3 tags)
-    const genres = (item._genreIds || [])
-      .slice(0, 3)
-      .map(id => GENRE_MAP[id])
-      .filter(Boolean);
+    // Genres — max 2 on card (keeps it compact)
+    const genres = (item._genreIds || []).slice(0,2).map(id => GENRE_MAP[id]).filter(Boolean);
     const genresHtml = genres.length
       ? `<div class="card-genres">${genres.map(g => `<span class="genre-tag">${g}</span>`).join('')}</div>`
       : '';
 
-    // Overview (stored from TMDB)
+    // Description — 2 lines
     const overviewHtml = item._overview
       ? `<p class="card-desc">${escHtml(item._overview)}</p>`
       : '';
@@ -259,10 +249,10 @@ function renderGrid(list = seriesData) {
     const card = document.createElement('div');
     card.className = 'card';
     card.innerHTML = `
-      <div class="poster-container" style="background:var(--input-bg);overflow:hidden;position:relative">
+      <div class="poster-container">
         ${item.poster
-          ? `<img src="${item.poster}" style="width:100%;height:100%;object-fit:cover" loading="lazy">`
-          : `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:3rem;color:var(--text-muted)">📺</div>`
+          ? `<img src="${item.poster}" loading="lazy" alt="${escHtml(item.title)}">`
+          : `<div class="poster-placeholder"><i class="fas fa-tv"></i></div>`
         }
       </div>
       <div class="card-body">
@@ -276,54 +266,118 @@ function renderGrid(list = seriesData) {
         <div class="card-stars">${stars}</div>
       </div>
     `;
-    if (isLoggedIn) card.onclick = () => openModal(realIdx);
+    // All users: click opens detail modal
+    card.onclick = () => openDetailModal(realIdx);
     grid.appendChild(card);
   });
 }
 
-// ─── Filter & Sort ────────────────────────────────────────────────────────────
-function filterData() {
-  const q = document.getElementById('searchInput').value.toLowerCase().trim();
-  const cat = document.getElementById('categoryFilter').value;
-  const sort = document.getElementById('sortSelect').value;
+// ─── Detail Modal ─────────────────────────────────────────────────────────────
+function openDetailModal(index) {
+  const item = seriesData[index];
+  if (!item) return;
+  const p = item.playerData || {};
 
-  let result = seriesData.filter(item => {
-    const matchSearch = !q || item.title.toLowerCase().includes(q);
-    const matchCat = !cat || item._category === cat;
-    return matchSearch && matchCat;
-  });
+  // Status badge
+  let statusHtml = '';
+  if (item.isMovie)    statusHtml = `<span class="badge badge-movie">Movie</span>`;
+  else if (p.finished) statusHtml = `<span class="badge badge-finished">Finished</span>`;
+  else                 statusHtml = `<span class="badge badge-watching">Watching — S${p.season||1} E${p.episode||0}</span>`;
 
-  result = [...result].sort((a, b) => {
-    if (sort === 'name')         return a.title.localeCompare(b.title);
-    if (sort === 'year-desc')    return (b.year||0) - (a.year||0);
-    if (sort === 'rating-desc')  return (b.rating||0) - (a.rating||0);
-    if (sort === 'updated-desc') {
-      return new Date(b.playerData?.updatedAt||0) - new Date(a.playerData?.updatedAt||0);
-    }
-    return 0;
-  });
+  // Full star rating display
+  const ratingStars = Array(5).fill(0).map((_,n) =>
+    `<span style="font-size:1.1rem;color:${n < Math.floor(item.rating||0) ? '#f5c518' : 'var(--border)'}">★</span>`
+  ).join('');
+  const ratingText = item.rating ? `${item.rating} / 5` : 'Not rated';
 
-  document.getElementById('count').textContent = `${result.length} of ${seriesData.length} titles`;
-  renderGrid(result);
+  // All genres
+  const genres = (item._genreIds || []).map(id => GENRE_MAP[id]).filter(Boolean);
+  const genresHtml = genres.length
+    ? `<div class="detail-genres">${genres.map(g => `<span class="genre-tag genre-tag-lg">${g}</span>`).join('')}</div>`
+    : '';
+
+  const overview = item._overview
+    ? `<p class="detail-overview">${escHtml(item._overview)}</p>`
+    : `<p class="detail-overview" style="opacity:0.4;font-style:italic">No description available.</p>`;
+
+  // Admin-only action buttons
+  const adminHtml = isLoggedIn ? `
+    <div style="display:flex;gap:8px;margin-top:4px">
+      <button onclick="openEditModal(${index})" class="btn-primary" style="flex:1;padding:10px;font-size:0.88rem">
+        <i class="fas fa-pen" style="margin-right:6px"></i>Edit
+      </button>
+      <button onclick="deleteItem(${index})" class="btn-danger" style="padding:10px 14px">
+        <i class="fas fa-trash"></i>
+      </button>
+    </div>
+  ` : '';
+
+  const modal = document.getElementById('modal');
+  const content = document.getElementById('modalContent');
+  modal.dataset.mode = 'detail';
+  content.innerHTML = `
+    <div class="detail-layout">
+      <!-- Poster -->
+      <div class="detail-poster-wrap">
+        ${item.poster
+          ? `<img src="${item.poster}" class="detail-poster-img" alt="${escHtml(item.title)}">`
+          : `<div class="detail-poster-placeholder"><i class="fas fa-tv"></i></div>`
+        }
+      </div>
+
+      <!-- Info -->
+      <div class="detail-info">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:10px">
+          <h2 class="detail-title">${escHtml(item.title)}</h2>
+          <button onclick="closeModal()" class="btn-close-x">✕</button>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+          ${item.year ? `<span class="detail-year">${item.year}</span>` : ''}
+          ${statusHtml}
+        </div>
+
+        ${genresHtml}
+
+        ${overview}
+
+        <div class="detail-rating-row">
+          <span class="detail-rating-stars">${ratingStars}</span>
+          <span class="detail-rating-label">${ratingText}</span>
+        </div>
+
+        ${adminHtml}
+
+        ${!isLoggedIn ? `
+          <button onclick="closeModal()" class="btn-secondary" style="width:100%;padding:10px;margin-top:4px">Close</button>
+        ` : ''}
+      </div>
+    </div>
+  `;
+
+  modal.classList.add('active');
 }
 
-// ─── Edit / Add Modal ─────────────────────────────────────────────────────────
-function openModal(index = -1) {
+// ─── Edit Modal ───────────────────────────────────────────────────────────────
+function openEditModal(index = -1) {
   const item = index >= 0 ? seriesData[index] : {};
   const p = item.playerData || {};
   currentRating = item.rating || 0;
 
+  const modal = document.getElementById('modal');
   const content = document.getElementById('modalContent');
+  modal.dataset.mode = 'edit';
+
   content.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
-      <h2 style="font-size:1.3rem;font-weight:700;color:var(--text)">${index === -1 ? 'Add New Title' : 'Edit Title'}</h2>
-      <button onclick="closeModal()" style="background:none;border:none;color:var(--text-muted);font-size:1.2rem;cursor:pointer">✕</button>
+      <h2 style="font-size:1.2rem;font-weight:700;color:var(--text)">${index === -1 ? 'Add New Title' : 'Edit Title'}</h2>
+      <button onclick="${index >= 0 ? `openDetailModal(${index})` : 'closeModal()'}" class="btn-close-x">✕</button>
     </div>
 
-    <label style="display:block;margin-bottom:4px;font-size:0.82rem;color:var(--text-muted)">Title</label>
+    <label class="form-label">Title</label>
     <input id="mTitle" value="${escHtml(item.title||'')}" class="input-field" placeholder="Series or movie title" style="margin-bottom:14px">
 
-    <label style="display:block;margin-bottom:4px;font-size:0.82rem;color:var(--text-muted)">Year</label>
+    <label class="form-label">Year</label>
     <input id="mYear" type="number" value="${item.year||''}" class="input-field" placeholder="e.g. 2024" style="margin-bottom:14px">
 
     <div style="display:flex;gap:24px;margin-bottom:16px">
@@ -346,17 +400,17 @@ function openModal(index = -1) {
     <div id="progressSection" style="${(p.finished || item.isMovie) ? 'display:none' : ''}">
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">
         <div>
-          <label style="display:block;margin-bottom:4px;font-size:0.82rem;color:var(--text-muted)">Season</label>
+          <label class="form-label">Season</label>
           <input id="mSeason" type="number" min="1" value="${p.season||1}" class="input-field">
         </div>
         <div>
-          <label style="display:block;margin-bottom:4px;font-size:0.82rem;color:var(--text-muted)">Episode</label>
+          <label class="form-label">Episode</label>
           <input id="mEpisode" type="number" min="0" value="${p.episode||0}" class="input-field">
         </div>
       </div>
     </div>
 
-    <label style="display:block;margin-bottom:8px;font-size:0.82rem;color:var(--text-muted)">My Rating</label>
+    <label class="form-label">My Rating</label>
     <div class="star-row" id="starRow">
       ${[1,2,3,4,5].map(n => `
         <button class="star-btn ${n <= Math.floor(currentRating) ? 'active' : ''}"
@@ -369,16 +423,18 @@ function openModal(index = -1) {
 
     <div style="display:flex;gap:10px">
       <button onclick="saveModal(${index})" class="btn-primary" style="flex:1;padding:12px">Save</button>
-      ${index >= 0 ? `<button onclick="deleteItem(${index})" style="background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.2);border-radius:12px;padding:12px 16px;cursor:pointer;font-weight:600">Delete</button>` : ''}
-      <button onclick="closeModal()" class="btn-secondary" style="flex:1;padding:12px">Cancel</button>
+      <button onclick="${index >= 0 ? `openDetailModal(${index})` : 'closeModal()'}" class="btn-secondary" style="flex:1;padding:12px">Cancel</button>
     </div>
   `;
 
-  document.getElementById('modal').classList.add('active');
+  modal.classList.add('active');
 }
 
+// Keep openModal as alias for backward compat
+function openModal(index) { openEditModal(index); }
+
 function updateProgressSection() {
-  const isMovie = document.getElementById('mMovie').checked;
+  const isMovie  = document.getElementById('mMovie').checked;
   const finished = document.getElementById('mFinished').checked;
   document.getElementById('progressSection').style.display = (isMovie || finished) ? 'none' : '';
 }
@@ -412,12 +468,12 @@ function saveModal(index) {
   };
 
   delete newItem._category;
-  if (isMovie)      newItem._category = 'Movies';
-  else if (finished)newItem._category = 'Finished';
-  else if (season>1)newItem._category = 'Ongoing';
-  else              newItem._category = 'Watching';
+  if (isMovie)       newItem._category = 'Movies';
+  else if (finished) newItem._category = 'Finished';
+  else if (season>1) newItem._category = 'Ongoing';
+  else               newItem._category = 'Watching';
 
-  // Clear TMDB cache if title changed so it re-fetches on next reload
+  // Clear TMDB cache if title changed
   if (index >= 0 && seriesData[index].title !== title) {
     delete newItem._tmdbId; delete newItem.poster;
     delete newItem._overview; delete newItem._genreIds;
@@ -427,9 +483,12 @@ function saveModal(index) {
   else seriesData.push(newItem);
 
   saveData();
-  closeModal();
   populateCategories();
   filterData();
+
+  // After saving, go back to detail view (or close if new)
+  if (index >= 0) openDetailModal(index);
+  else closeModal();
 }
 
 function deleteItem(index) {
@@ -438,8 +497,13 @@ function deleteItem(index) {
   saveData(); closeModal(); populateCategories(); filterData();
 }
 
-function closeModal() { document.getElementById('modal').classList.remove('active'); }
-function handleOverlayClick(e) { if (e.target === document.getElementById('modal')) closeModal(); }
+function closeModal() {
+  document.getElementById('modal').classList.remove('active');
+}
+
+function handleOverlayClick(e) {
+  if (e.target === document.getElementById('modal')) closeModal();
+}
 
 // ─── Login Modal ──────────────────────────────────────────────────────────────
 function showLoginModal() {
@@ -447,14 +511,14 @@ function showLoginModal() {
   content.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
       <h2 style="font-size:1.3rem;font-weight:700;color:var(--text)">Login</h2>
-      <button onclick="closeModal()" style="background:none;border:none;color:var(--text-muted);font-size:1.2rem;cursor:pointer">✕</button>
+      <button onclick="closeModal()" class="btn-close-x">✕</button>
     </div>
     <div id="loginError" style="display:none;background:rgba(239,68,68,0.1);color:#ef4444;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:0.85rem">
       ❌ Wrong username or password.
     </div>
-    <label style="display:block;margin-bottom:4px;font-size:0.82rem;color:var(--text-muted)">Username</label>
+    <label class="form-label">Username</label>
     <input id="lUser" class="input-field" placeholder="Username" style="margin-bottom:12px" onkeydown="if(event.key==='Enter')doLogin()">
-    <label style="display:block;margin-bottom:4px;font-size:0.82rem;color:var(--text-muted)">Password</label>
+    <label class="form-label">Password</label>
     <input id="lPass" type="password" class="input-field" placeholder="Password" style="margin-bottom:20px" onkeydown="if(event.key==='Enter')doLogin()">
     <div style="display:flex;gap:10px">
       <button onclick="doLogin()" class="btn-primary" style="flex:1;padding:12px">Login</button>
@@ -508,13 +572,10 @@ function exportFile() {
   a.click();
 }
 
-// ─── Persistence ──────────────────────────────────────────────────────────────
 function saveData() { localStorage.setItem('wl_data', JSON.stringify(seriesData)); }
 
-// ─── Utils ────────────────────────────────────────────────────────────────────
 function escHtml(str) {
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-// ─── Boot ─────────────────────────────────────────────────────────────────────
 init();
