@@ -20,7 +20,6 @@ let seriesData    = [];
 let isLoggedIn    = false;
 let isDarkMode    = true;
 let currentRating = 0;
-let syncPending   = false;
 
 // Credentials held in memory for the session (used when POSTing to server)
 let _sessionCreds = null;
@@ -97,14 +96,13 @@ async function fetchServerData() {
   } catch { return null; }
 }
 
-// Push to server fire-and-forget; shows a subtle "Saving…" badge while in flight
+// Push to server — fire-and-forget with toast feedback
 async function pushToServer() {
   if (!isLoggedIn) return;
   const creds = _sessionCreds || getStoredCreds();
   if (!creds) return;
 
-  syncPending = true;
-  updateSyncBadge();
+  showToast(ICONS.sync + ' Saving to server…', 'saving', 10000);
 
   try {
     const res = await fetch('/.netlify/functions/data', {
@@ -112,12 +110,17 @@ async function pushToServer() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ user: creds.u, pass: creds.p, data: seriesData }),
     });
-    if (!res.ok) console.warn('[sync] failed:', res.status);
+    if (res.ok) {
+      const json = await res.json();
+      showToast('✓ Saved ' + json.saved + ' titles', 'saved', 2500);
+    } else {
+      const err = await res.json().catch(() => ({}));
+      showToast('✗ Save failed: ' + (err.error || res.status), 'error', 4000);
+      console.warn('[sync] failed:', res.status, err);
+    }
   } catch (err) {
+    showToast('✗ Network error — saved locally only', 'error', 4000);
     console.warn('[sync] network error:', err.message);
-  } finally {
-    syncPending = false;
-    updateSyncBadge();
   }
 }
 
@@ -126,9 +129,38 @@ function getStoredCreds() {
   catch { return null; }
 }
 
-function updateSyncBadge() {
-  const el = document.getElementById('syncBadge');
-  if (el) el.style.opacity = syncPending ? '1' : '0';
+function showToast(msg, type = 'info', duration = 2800) {
+  // type: 'saving' | 'saved' | 'error'
+  let toast = document.getElementById('wl-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'wl-toast';
+    document.body.appendChild(toast);
+  }
+  const colors = {
+    saving: { bg: '#d57455', text: '#fff' },
+    saved:  { bg: '#22c55e', text: '#fff' },
+    error:  { bg: '#ef4444', text: '#fff' },
+    info:   { bg: '#3b3b3a', text: '#c3c2b7' },
+  };
+  const c = colors[type] || colors.info;
+  toast.style.cssText = `
+    position:fixed; bottom:24px; right:24px; z-index:9999;
+    background:${c.bg}; color:${c.text};
+    padding:10px 18px; border-radius:12px;
+    font-size:0.82rem; font-weight:600; font-family:inherit;
+    box-shadow:0 4px 20px rgba(0,0,0,0.35);
+    display:flex; align-items:center; gap:8px;
+    transform:translateY(0); opacity:1;
+    transition:opacity 0.35s, transform 0.35s;
+    pointer-events:none;
+  `;
+  toast.innerHTML = msg;
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => {
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateY(8px)';
+  }, duration);
 }
 
 // ─── saveData: localStorage + server ─────────────────────────────────────────
@@ -326,14 +358,6 @@ function renderHeader() {
     isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'));
 
   if (isLoggedIn) {
-    // Subtle "Saving…" badge shown while syncing to server
-    const badge = document.createElement('span');
-    badge.id = 'syncBadge';
-    badge.title = 'Syncing to server…';
-    badge.style.cssText = `display:inline-flex;align-items:center;gap:4px;font-size:0.72rem;color:var(--text-muted);opacity:${syncPending?1:0};transition:opacity 0.3s;`;
-    badge.innerHTML = ICONS.sync + ' Saving…';
-    c.appendChild(badge);
-
     c.appendChild(mkBtn('btn-ghost btn', ICONS.import + ' Import', () => document.getElementById('fileInput').click()));
     c.appendChild(mkBtn('btn-ghost btn', ICONS.export + ' Export', exportFile));
     c.appendChild(mkBtn('btn-accent btn', ICONS.plus + ' Add', openEditModal));
